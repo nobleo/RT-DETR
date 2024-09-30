@@ -64,6 +64,8 @@ class BasicBlock(nn.Module):
                 ]))
             else:
                 self.short = ConvNormLayer(ch_in, ch_out, 1, stride)
+        else:
+            self.short = nn.Identity()  # Define self.short as Identity when shortcut is True
 
         self.branch2a = ConvNormLayer(ch_in, ch_out, 3, stride, act=act)
         self.branch2b = ConvNormLayer(ch_out, ch_out, 3, 1, act=None)

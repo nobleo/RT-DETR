@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn 
 import torch.nn.functional as F 
 import torch.nn.init as init 
-from typing import List
+from typing import List, Tuple
 
 from .denoising import get_contrastive_denoising_training_group
 from .utils import deformable_attention_core_func_v2, get_activation, inverse_sigmoid
@@ -55,9 +55,9 @@ class MSDeformableAttention(nn.Module):
 
         if isinstance(num_points, list):
             assert len(num_points) == num_levels, ''
-            num_points_list = num_points
+            num_points_list: List[int] = num_points
         else:
-            num_points_list = [num_points for _ in range(num_levels)]
+            num_points_list: List[int] = [num_points for _ in range(num_levels)]
 
         self.num_points_list = num_points_list
         
@@ -75,7 +75,6 @@ class MSDeformableAttention(nn.Module):
         self.value_proj = nn.Linear(embed_dim, embed_dim)
         self.output_proj = nn.Linear(embed_dim, embed_dim)
 
-        self.ms_deformable_attn_core = functools.partial(deformable_attention_core_func_v2, method=self.method) 
 
         self._reset_parameters()
 
@@ -83,6 +82,26 @@ class MSDeformableAttention(nn.Module):
             for p in self.sampling_offsets.parameters():
                 p.requires_grad = False
 
+    def ms_deformable_attn_core(
+        self, 
+        value: torch.Tensor, 
+        value_spatial_shapes: List[List[int]], 
+        sampling_locations: torch.Tensor, 
+        attention_weights: torch.Tensor, 
+        num_points_list: List[int]
+    ) -> torch.Tensor:
+        # Ensure value_spatial_shapes is a List[List[int]]
+        if isinstance(value_spatial_shapes, torch.Tensor):
+            value_spatial_shapes = value_spatial_shapes.tolist()
+        return deformable_attention_core_func_v2(
+            value, 
+            value_spatial_shapes, 
+            sampling_locations, 
+            attention_weights, 
+            num_points_list, 
+            method=self.method
+        )
+    
     def _reset_parameters(self):
         # sampling_offsets
         init.constant_(self.sampling_offsets.weight, 0)
@@ -109,7 +128,7 @@ class MSDeformableAttention(nn.Module):
                 query: torch.Tensor,
                 reference_points: torch.Tensor,
                 value: torch.Tensor,
-                value_spatial_shapes: List[int],
+                value_spatial_shapes: List[List[int]],
                 value_mask: torch.Tensor=None):
         """
         Args:
@@ -153,7 +172,12 @@ class MSDeformableAttention(nn.Module):
                 "Last dim of reference_points must be 2 or 4, but get {} instead.".
                 format(reference_points.shape[-1]))
 
-        output = self.ms_deformable_attn_core(value, value_spatial_shapes, sampling_locations, attention_weights, self.num_points_list)
+        output = self.ms_deformable_attn_core(
+            value=value,
+            value_spatial_shapes=value_spatial_shapes,
+            sampling_locations=sampling_locations, 
+            attention_weights=attention_weights, 
+            num_points_list=self.num_points_list)
 
         output = self.output_proj(output)
 
@@ -206,7 +230,7 @@ class TransformerDecoderLayer(nn.Module):
                 target,
                 reference_points,
                 memory,
-                memory_spatial_shapes,
+                memory_spatial_shapes: List[List[int]],
                 attn_mask=None,
                 memory_mask=None,
                 query_pos_embed=None):
@@ -236,47 +260,71 @@ class TransformerDecoderLayer(nn.Module):
 
 
 class TransformerDecoder(nn.Module):
-    def __init__(self, hidden_dim, decoder_layer, num_layers, eval_idx=-1):
+    def __init__(self, hidden_dim, decoder_layer, num_layers, eval_idx=-1, query_post_head=None, num_classes=None):
         super(TransformerDecoder, self).__init__()
         self.layers = nn.ModuleList([copy.deepcopy(decoder_layer) for _ in range(num_layers)])
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.eval_idx = eval_idx if eval_idx >= 0 else num_layers + eval_idx
+        self.query_post_head = query_post_head
+
+        # Initialize decoder heads
+        self.dec_score_head = nn.ModuleList([
+            nn.Linear(hidden_dim, num_classes) for _ in range(num_layers)
+        ])
+        self.dec_bbox_head = nn.ModuleList([
+            MLP(hidden_dim, hidden_dim, 4, 3) for _ in range(num_layers)
+        ])
+
+class TransformerDecoder(nn.Module):
+    def __init__(self, hidden_dim, decoder_layer, num_layers, eval_idx=-1, query_post_head=None, num_classes=None):
+        super(TransformerDecoder, self).__init__()
+        self.layers = nn.ModuleList([copy.deepcopy(decoder_layer) for _ in range(num_layers)])
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.eval_idx = eval_idx if eval_idx >= 0 else num_layers + eval_idx
+        self.query_post_head = query_post_head
+
+        # Initialize decoder heads
+        self.dec_score_head = nn.ModuleList([
+            nn.Linear(hidden_dim, num_classes) for _ in range(num_layers)
+        ])
+        self.dec_bbox_head = nn.ModuleList([
+            MLP(hidden_dim, hidden_dim, 4, 3) for _ in range(num_layers)
+        ])
 
     def forward(self,
                 target,
                 ref_points_unact,
                 memory,
-                memory_spatial_shapes,
-                bbox_head,
-                score_head,
-                query_pos_head,
+                memory_spatial_shapes: List[List[int]],
                 attn_mask=None,
                 memory_mask=None):
         dec_out_bboxes = []
         dec_out_logits = []
         ref_points_detach = F.sigmoid(ref_points_unact)
+        ref_points = ref_points_detach
 
         output = target
-        for i, layer in enumerate(self.layers):
+        for i, (layer, bbox_head, score_head) in enumerate(zip(self.layers, self.dec_bbox_head, self.dec_score_head)):
             ref_points_input = ref_points_detach.unsqueeze(2)
-            query_pos_embed = query_pos_head(ref_points_detach)
+            query_pos_embed = self.query_post_head(ref_points_detach)
 
             output = layer(output, ref_points_input, memory, memory_spatial_shapes, attn_mask, memory_mask, query_pos_embed)
 
-            inter_ref_bbox = F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points_detach))
+            inter_ref_bbox = F.sigmoid(bbox_head(output) + inverse_sigmoid(ref_points_detach))
 
             if self.training:
-                dec_out_logits.append(score_head[i](output))
+                dec_out_logits.append(score_head(output))
                 if i == 0:
                     dec_out_bboxes.append(inter_ref_bbox)
                 else:
-                    dec_out_bboxes.append(F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points)))
+                    dec_out_bboxes.append(F.sigmoid(bbox_head(output) + inverse_sigmoid(ref_points)))
 
             elif i == self.eval_idx:
-                dec_out_logits.append(score_head[i](output))
+                dec_out_logits.append(score_head(output))
                 dec_out_bboxes.append(inter_ref_bbox)
-                break
+
 
             ref_points = inter_ref_bbox
             ref_points_detach = inter_ref_bbox.detach()
@@ -337,10 +385,19 @@ class RTDETRTransformerv2(nn.Module):
         # backbone feature projection
         self._build_input_proj_layer(feat_channels)
 
+        # decoder head
+        self.dec_score_head = nn.ModuleList([
+            nn.Linear(hidden_dim, num_classes) for _ in range(num_layers)
+        ])
+        self.dec_bbox_head = nn.ModuleList([
+            MLP(hidden_dim, hidden_dim, 4, 3) for _ in range(num_layers)
+        ])
+
+        self.query_pos_head = MLP(4, 2 * hidden_dim, hidden_dim, 2)
         # Transformer module
         decoder_layer = TransformerDecoderLayer(hidden_dim, nhead, dim_feedforward, dropout, \
             activation, num_levels, num_points, cross_attn_method=cross_attn_method)
-        self.decoder = TransformerDecoder(hidden_dim, decoder_layer, num_layers, eval_idx)
+        self.decoder = TransformerDecoder(hidden_dim, decoder_layer, num_layers, eval_idx, self.query_pos_head, num_classes)
 
         # denoising
         self.num_denoising = num_denoising
@@ -354,7 +411,6 @@ class RTDETRTransformerv2(nn.Module):
         self.learn_query_content = learn_query_content
         if learn_query_content:
             self.tgt_embed = nn.Embedding(num_queries, hidden_dim)
-        self.query_pos_head = MLP(4, 2 * hidden_dim, hidden_dim, 2)
 
         # if num_select_queries != self.num_queries:
         #     layer = TransformerEncoderLayer(hidden_dim, nhead, dim_feedforward, activation='gelu')
@@ -372,13 +428,6 @@ class RTDETRTransformerv2(nn.Module):
 
         self.enc_bbox_head = MLP(hidden_dim, hidden_dim, 4, 3)
 
-        # decoder head
-        self.dec_score_head = nn.ModuleList([
-            nn.Linear(hidden_dim, num_classes) for _ in range(num_layers)
-        ])
-        self.dec_bbox_head = nn.ModuleList([
-            MLP(hidden_dim, hidden_dim, 4, 3) for _ in range(num_layers)
-        ])
 
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:
@@ -428,21 +477,24 @@ class RTDETRTransformerv2(nn.Module):
             )
             in_channels = self.hidden_dim
 
-    def _get_encoder_input(self, feats: List[torch.Tensor]):
+    def _get_encoder_input(self, feats: List[torch.Tensor]) -> Tuple[torch.Tensor, List[List[int]]]:
         # get projection features
-        proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
+        proj_feats = []
+        for proj, feat in zip(self.input_proj, feats):
+            proj_feats.append(proj(feat))
+
         if self.num_levels > len(proj_feats):
             len_srcs = len(proj_feats)
-            for i in range(len_srcs, self.num_levels):
+            for i, proj in enumerate(self.input_proj[len_srcs:self.num_levels], start=len_srcs):
                 if i == len_srcs:
-                    proj_feats.append(self.input_proj[i](feats[-1]))
+                    proj_feats.append(proj(feats[-1]))
                 else:
-                    proj_feats.append(self.input_proj[i](proj_feats[-1]))
+                    proj_feats.append(proj(proj_feats[-1]))
 
         # get encoder inputs
         feat_flatten = []
         spatial_shapes = []
-        for i, feat in enumerate(proj_feats):
+        for feat in proj_feats:
             _, _, h, w = feat.shape
             # [b, c, h, w] -> [b, h*w, c]
             feat_flatten.append(feat.flatten(2).permute(0, 2, 1))
@@ -577,9 +629,6 @@ class RTDETRTransformerv2(nn.Module):
             init_ref_points_unact,
             memory,
             spatial_shapes,
-            self.dec_bbox_head,
-            self.dec_score_head,
-            self.query_pos_head,
             attn_mask=attn_mask)
 
         if self.training and dn_meta is not None:

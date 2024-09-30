@@ -67,11 +67,11 @@ def deformable_attention_core_func(value, value_spatial_shapes, sampling_locatio
 
 def deformable_attention_core_func_v2(\
     value: torch.Tensor, 
-    value_spatial_shapes,
+    value_spatial_shapes: List[List[int]],
     sampling_locations: torch.Tensor, 
     attention_weights: torch.Tensor, 
     num_points_list: List[int], 
-    method='default'):
+    method: str ='default'):
     """
     Args:
         value (Tensor): [bs, value_length, n_head, c]
@@ -85,7 +85,6 @@ def deformable_attention_core_func_v2(\
     """
     bs, _, n_head, c = value.shape
     _, Len_q, _, _, _ = sampling_locations.shape
-        
     split_shape = [h * w for h, w in value_spatial_shapes]
     value_list = value.permute(0, 2, 3, 1).flatten(0, 1).split(split_shape, dim=-1)
 
@@ -93,7 +92,7 @@ def deformable_attention_core_func_v2(\
     if method == 'default':
         sampling_grids = 2 * sampling_locations - 1
 
-    elif method == 'discrete':
+    else:
         sampling_grids = sampling_locations
 
     sampling_grids = sampling_grids.permute(0, 2, 1, 3, 4).flatten(0, 1)
@@ -112,7 +111,7 @@ def deformable_attention_core_func_v2(\
                 padding_mode='zeros', 
                 align_corners=False)
         
-        elif method == 'discrete':
+        else:
             # n * m, seq, n, 2
             sampling_coord = (sampling_grid_l * torch.tensor([[w, h]], device=value.device) + 0.5).to(torch.int64)
 
